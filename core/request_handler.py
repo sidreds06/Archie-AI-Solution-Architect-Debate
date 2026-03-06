@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config import MAX_DEEP_DIVES, MAX_EXTRA_ROUNDS
+from config import MAX_EXTRA_ROUNDS
 from state import DebateState
 
 
@@ -14,7 +14,6 @@ def process_requests(state: DebateState) -> dict:
 
     updates: dict = {"agent_requests": []}
     events: list[str] = list(state.get("dramatic_events", []))
-    deep_dives_used = state.get("deep_dives_used", 0)
 
     for req in requests:
         req_type = req.get("request_type", "")
@@ -30,11 +29,6 @@ def process_requests(state: DebateState) -> dict:
                 "winner": "proposer",
                 "reasoning": f"Adversary conceded: {detail}",
             }
-
-        elif req_type == "deep_dive" and deep_dives_used < MAX_DEEP_DIVES:
-            events.append("DEEP DIVE REQUESTED!")
-            updates["pending_deep_dive"] = detail
-            updates["deep_dives_used"] = deep_dives_used + 1
 
         elif req_type == "extra_round":
             current_max = state["max_rounds"]
@@ -53,9 +47,6 @@ def process_requests(state: DebateState) -> dict:
 
 def route_after_requests(state: DebateState) -> str:
     """Determine next step after request processing."""
-    if state.get("pending_deep_dive"):
-        return "deep_dive"
-
     if not state.get("debate_active", True):
         return "verdict"
 

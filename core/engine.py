@@ -16,9 +16,9 @@ from core.interviewer import InterviewEngine
 from core.proposer import ProposerEngine
 from core.adversary import AdversaryEngine
 from core.moderator import ModeratorEngine
+from core.moderator_hub import route_after_scoring, should_force_hitl
 from core.scoreboard import compute_scoreboard
-from core.request_handler import process_requests, route_after_requests
-from core.deep_dive import DeepDiveEngine
+from core.request_handler import process_requests
 from core.verdict import VerdictEngine
 
 
@@ -58,11 +58,11 @@ class DebateEngine:
             "enriched_context": "",
             "score_history": [],
             "agent_requests": [],
-            "pending_deep_dive": None,
-            "deep_dives_used": 0,
             "momentum": {"proposer": 0.0, "adversary": 0.0},
             "dramatic_events": [],
             "user_interjection": None,
+            # Hub-spoke orchestration
+            "debate_phase": "init",
             # UI metadata
             "search_metadata": [],
             "timing": {"debate_start": time.time(), "round_times": []},
@@ -73,7 +73,6 @@ class DebateEngine:
         self._proposer = ProposerEngine()
         self._adversary = AdversaryEngine()
         self._moderator = ModeratorEngine()
-        self._deep_dive = DeepDiveEngine()
         self._verdict = VerdictEngine()
         self._interview_qa: list[tuple[str, str]] = []
         self._pending_hitl_verdict: dict | None = None
@@ -128,7 +127,10 @@ class DebateEngine:
     # Debate round
     # ------------------------------------------------------------------
     def run_round(self, direction: str = "") -> Generator[Event, None, None]:
-        """Run one full round: proposer → adversary → moderator → scoreboard → requests.
+        """Run one full round: proposer -> adversary -> moderator -> scoreboard -> requests.
+
+        Proposer and adversary autonomously call tools (web_search, deep_dive)
+        during their response generation.
 
         Yields events throughout. If HITL is needed, yields a hitl_request
         event and stops — caller must then call run_hitl_rescore().
@@ -142,41 +144,37 @@ class DebateEngine:
 
         yield {"type": "round_start", "round": current_round, "max_rounds": max_rounds}
 
-        # --- Proposer ---
+        # --- Proposer (tool-calling agent) ---
         yield {"type": "phase_change", "phase": "proposer"}
         proposer_tokens = 0
         for event in self._proposer.run(self.state):
             if event["type"] == "token":
                 proposer_tokens += 1
             yield event
-        # Apply proposer updates to state
         if self._proposer.last_result:
             self._apply_updates(self._proposer.last_result)
         self.state["token_counts"]["proposer"].append(proposer_tokens)
 
-        # --- Adversary ---
+        # --- Adversary (tool-calling agent) ---
         yield {"type": "phase_change", "phase": "adversary"}
         adversary_tokens = 0
         for event in self._adversary.run(self.state):
             if event["type"] == "token":
                 adversary_tokens += 1
             yield event
-        # Apply adversary updates
         if self._adversary.last_result:
             self._apply_updates(self._adversary.last_result)
         self.state["token_counts"]["adversary"].append(adversary_tokens)
 
-        # --- Moderator ---
+        # --- Moderator Score ---
         yield {"type": "phase_change", "phase": "moderator"}
         for event in self._moderator.score(self.state):
             yield event
 
-        # Apply moderator updates
         if self._moderator.last_verdict:
             verdict = self._moderator.last_verdict
-            from core.moderator import update_proposal_scores, maybe_force_hitl
+            from core.moderator import update_proposal_scores
 
-            verdict = maybe_force_hitl(verdict, current_round)
             updated_proposals = update_proposal_scores(
                 self.state["proposals"], verdict, current_round
             )
@@ -184,20 +182,6 @@ class DebateEngine:
             self.state["final_verdict"] = verdict
 
             decision = verdict.get("decision", "continue")
-
-            # Check for HITL
-            if decision == "hitl":
-                self._pending_hitl_verdict = verdict
-                self.state["hitl_pending"] = verdict.get("hitl_question", "")
-                yield {
-                    "type": "hitl_request",
-                    "question": verdict.get("hitl_question", "Please clarify a constraint."),
-                    "scores": verdict.get("scores", {}),
-                    "round": current_round,
-                }
-                # Don't continue — caller handles HITL
-                return
-
             if decision == "end":
                 self.state["debate_active"] = False
 
@@ -213,13 +197,22 @@ class DebateEngine:
         # Clear consumed fields
         self.state["user_interjection"] = None
 
-        # Yield routing decision
-        route = route_after_requests(self.state)
+        # Use hub routing logic
+        route = route_after_scoring(self.state)
         yield {"type": "route", "decision": route}
 
-        # If deep dive was requested, run it
-        if route == "deep_dive":
-            yield from self._run_deep_dive()
+        # Handle HITL via hub routing
+        if route == "hitl":
+            verdict = self.state.get("final_verdict") or {}
+            self._pending_hitl_verdict = verdict
+            self.state["hitl_pending"] = verdict.get("hitl_question", "")
+            yield {
+                "type": "hitl_request",
+                "question": verdict.get("hitl_question", "Please clarify a constraint."),
+                "scores": verdict.get("scores", {}),
+                "round": current_round,
+            }
+            return
 
     def run_hitl_rescore(self, answer: str) -> Generator[Event, None, None]:
         """Re-score after HITL answer, potentially loop for another HITL."""
@@ -285,11 +278,8 @@ class DebateEngine:
         yield from self._run_scoreboard()
         yield from self._run_request_handler()
 
-        route = route_after_requests(self.state)
+        route = route_after_scoring(self.state)
         yield {"type": "route", "decision": route}
-
-        if route == "deep_dive":
-            yield from self._run_deep_dive()
 
     # ------------------------------------------------------------------
     # Round increment
@@ -346,7 +336,6 @@ class DebateEngine:
             "max_rounds": self.state["max_rounds"],
             "total_searches": total_searches,
             "hitl_count": len(self.state.get("hitl_history", [])),
-            "deep_dives": self.state.get("deep_dives_used", 0),
             "proposer_tokens": self.state.get("token_counts", {}).get("proposer", []),
             "adversary_tokens": self.state.get("token_counts", {}).get("adversary", []),
         }
@@ -379,44 +368,3 @@ class DebateEngine:
                 "detail": req.get("detail", ""),
             }
         self._apply_updates(result)
-
-    def _run_deep_dive(self) -> Generator[Event, None, None]:
-        """Run deep dive sub-round."""
-        topic = self.state.get("pending_deep_dive", "")
-        yield {"type": "deep_dive_start", "topic": topic}
-
-        # Proposer deep dive
-        yield {"type": "phase_change", "phase": "deep_dive_proposer"}
-        for event in self._deep_dive.run_proposer(self.state):
-            yield event
-        if self._deep_dive.last_proposer_result:
-            self._apply_updates(self._deep_dive.last_proposer_result)
-
-        # Adversary deep dive
-        yield {"type": "phase_change", "phase": "deep_dive_adversary"}
-        for event in self._deep_dive.run_adversary(self.state):
-            yield event
-        if self._deep_dive.last_adversary_result:
-            self._apply_updates(self._deep_dive.last_adversary_result)
-
-        # Re-score with moderator
-        yield {"type": "phase_change", "phase": "moderator"}
-        for event in self._moderator.score(self.state):
-            yield event
-        if self._moderator.last_verdict:
-            from core.moderator import update_proposal_scores
-            verdict = self._moderator.last_verdict
-            updated = update_proposal_scores(
-                self.state["proposals"], verdict, self.state["round"]
-            )
-            self.state["proposals"] = updated
-            self.state["final_verdict"] = verdict
-
-            if verdict.get("decision") == "end":
-                self.state["debate_active"] = False
-
-        yield from self._run_scoreboard()
-        yield from self._run_request_handler()
-
-        route = route_after_requests(self.state)
-        yield {"type": "route", "decision": route}

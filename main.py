@@ -83,13 +83,17 @@ def main() -> None:
         "score_history": [],
         # Dynamic graph
         "agent_requests": [],
-        "pending_deep_dive": None,
-        "deep_dives_used": 0,
         # Momentum
         "momentum": {"proposer": 0.0, "adversary": 0.0},
         "dramatic_events": [],
         # User interjection
         "user_interjection": None,
+        # Hub-spoke orchestration
+        "debate_phase": "init",
+        # HITL history
+        "hitl_history": [],
+        # Internal: agent loop messages (reset per subgraph call)
+        "_agent_messages": [],
     }
 
     app = build_graph()

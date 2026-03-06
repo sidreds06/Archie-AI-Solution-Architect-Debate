@@ -104,11 +104,23 @@ def interviewer(state: DebateState) -> dict:
     lines = [f"Q: {q}\nA: {a}" for q, a in qa_history if a]
     enriched_context = "\n\n".join(lines)
 
-    console.print(
-        Panel(
-            "[bold green]Requirements captured. Starting the debate![/bold green]",
-            border_style="green",
-        )
-    )
+    # Show captured requirements summary
+    if qa_history:
+        summary_lines = []
+        for q, a in qa_history:
+            if a:
+                summary_lines.append(f"[yellow]Q:[/yellow] {q}\n[white]A:[/white] {a}")
+        if summary_lines:
+            console.print(
+                Panel(
+                    "\n\n".join(summary_lines),
+                    title="[dim]Captured Requirements[/dim]",
+                    border_style="dim",
+                    padding=(1, 2),
+                )
+            )
 
-    return {"enriched_context": enriched_context}
+    from ui.banners import debate_start_banner
+    debate_start_banner()
+
+    return {"enriched_context": enriched_context, "debate_phase": "init"}

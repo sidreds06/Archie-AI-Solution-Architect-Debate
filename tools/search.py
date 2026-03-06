@@ -1,5 +1,7 @@
 import os
+import time
 
+from requests.exceptions import ConnectionError, Timeout
 from tavily import TavilyClient
 
 _client: TavilyClient | None = None
@@ -55,16 +57,23 @@ def run_search(
     }
     if include_domains:
         kwargs["include_domains"] = include_domains
-    response = client.search(**kwargs)
-    results = response.get("results", [])
-    return [
-        {
-            "url": r.get("url", ""),
-            "title": r.get("title", ""),
-            "content": r.get("content", ""),  # full content, no truncation
-        }
-        for r in results
-    ]
+    for attempt in range(3):
+        try:
+            response = client.search(**kwargs)
+            results = response.get("results", [])
+            return [
+                {
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "content": r.get("content", ""),  # full content, no truncation
+                }
+                for r in results
+            ]
+        except (ConnectionError, Timeout, OSError):
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            return []  # graceful fallback: no results instead of crash
 
 
 def search_for_docs(query: str, max_results: int = 5) -> list[dict]:

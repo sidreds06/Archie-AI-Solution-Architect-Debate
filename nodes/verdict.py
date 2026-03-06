@@ -7,6 +7,7 @@ from rich.panel import Panel
 from config import MODERATOR_MODEL, OPENROUTER_API_KEY, OPENROUTER_BASE_URL
 from memory import manager as memory_manager
 from state import DebateState
+from ui.banners import session_footer, verdict_banner
 from ui.streaming import stream_to_panel
 
 console = Console()
@@ -35,14 +36,23 @@ def verdict(state: DebateState) -> dict:
     if not winning_solution and state["proposals"]:
         winning_solution = state["proposals"][-1]["solution"]
 
-    # Build score summary for the brief
-    score_summary = ""
+    # Get final scores
+    p_score = 0.0
+    a_score = 0.0
     if score_history:
         last = score_history[-1]
-        score_summary = (
-            f"\nFINAL SCORES: Proposer {last.get('proposer_score', 0):.2f} | "
-            f"Adversary {last.get('adversary_score', 0):.2f}\n"
-        )
+        p_score = last.get("proposer_score", 0.0)
+        a_score = last.get("adversary_score", 0.0)
+
+    # Print final scoreboard
+    from nodes.moderator_subgraph import _render_scoreboard
+    _render_scoreboard(score_history)
+
+    # Winner announcement
+    verdict_banner(winner, p_score, a_score)
+
+    # Build score summary for the brief
+    score_summary = f"\nFINAL SCORES: Proposer {p_score:.2f} | Adversary {a_score:.2f}\n"
 
     client = _get_moderator_client()
 
@@ -66,8 +76,8 @@ def verdict(state: DebateState) -> dict:
         HumanMessage(content=brief_prompt),
     ]
 
-    title = "[bold green]Final Verdict — Architecture Brief[/bold green]"
-    brief = stream_to_panel(client, messages, title, "green")
+    title = "[bold white]Architecture Brief[/bold white]"
+    brief = stream_to_panel(client, messages, title, "bright_white")
     brief = brief.strip()
 
     # Re-render with Markdown formatting
@@ -75,7 +85,7 @@ def verdict(state: DebateState) -> dict:
         Panel(
             Markdown(brief),
             title=title,
-            border_style="green",
+            border_style="bright_white",
         )
     )
 
@@ -87,6 +97,6 @@ def verdict(state: DebateState) -> dict:
         moderator_client=client,
     )
 
-    console.print("[dim]Memory updated.[/dim]")
+    session_footer(state["round"], memory_updated=True)
 
     return {"user_memory": updated_memory}

@@ -1,103 +1,61 @@
 from langgraph.graph import END, START, StateGraph
 
-from nodes.adversary import adversary
-from nodes.deep_dive import deep_dive_adversary, deep_dive_proposer
+from nodes.adversary_subgraph import build_adversary_subgraph
 from nodes.interviewer import interviewer
 from nodes.loader import load_memory
-from nodes.moderator import moderator
-from nodes.proposer import proposer
-from nodes.request_handler import handle_agent_requests
-from nodes.round_increment import round_increment
-from nodes.scoreboard import update_scoreboard
+from nodes.moderator_subgraph import build_moderator_subgraph, parent_router
+from nodes.proposer_subgraph import build_proposer_subgraph
 from nodes.verdict import verdict
 from state import DebateState
 
 
-def route_after_requests(state: DebateState) -> str:
-    """
-    Conditional edge router called after the request handler.
-    HITL is now handled inline by the moderator, so this only routes
-    to deep_dive, round_increment, or verdict.
-    """
-    # Deep dive takes priority if requested
-    if state.get("pending_deep_dive"):
-        return "deep_dive_proposer"
-
-    # Check if debate ended (from agent "agree" or moderator "end")
-    if not state.get("debate_active", True):
-        return "verdict"
-
-    verdict_data = state.get("final_verdict") or {}
-    decision = verdict_data.get("decision", "continue")
-
-    if decision == "end":
-        return "verdict"
-    else:
-        # "continue" or any resolved post-hitl decision
-        return "round_increment"
-
-
 def build_graph() -> StateGraph:
     """
-    Construct and compile the LangGraph StateGraph.
+    Construct and compile the LangGraph StateGraph with 3 subgraph agents.
 
-    Flow:
-      START → load_memory → interviewer → proposer → adversary → moderator (+ inline HITL)
-                                                                    ↓
-                                                                scoreboard
-                                                                    ↓
-                                                            request_handler
-                                                                    ↓
-                                                          route_after_requests()
-                                                          ├── deep_dive_proposer → deep_dive_adversary → moderator
-                                                          ├── round_increment → proposer
-                                                          └── verdict → END
+    Parent graph (6 nodes):
+      START → load_memory → interviewer → moderator ↔ proposer / adversary → verdict → END
+
+    Moderator subgraph (tool-calling agent):
+      evaluate → think → hitl (tool, looping) → respond
+
+    Proposer subgraph (tool-calling agent):
+      think → web_search / deep_dive (tools, looping) → respond
+
+    Adversary subgraph (tool-calling agent):
+      think → web_search / deep_dive (tools, looping) → respond
     """
     builder = StateGraph(DebateState)
 
-    # Register all nodes
+    # -- Register nodes (3 are compiled subgraphs) --
     builder.add_node("load_memory", load_memory)
     builder.add_node("interviewer", interviewer)
-    builder.add_node("proposer", proposer)
-    builder.add_node("adversary", adversary)
-    builder.add_node("moderator", moderator)
-    builder.add_node("scoreboard", update_scoreboard)
-    builder.add_node("request_handler", handle_agent_requests)
-    builder.add_node("round_increment", round_increment)
-    builder.add_node("deep_dive_proposer", deep_dive_proposer)
-    builder.add_node("deep_dive_adversary", deep_dive_adversary)
+    builder.add_node("moderator", build_moderator_subgraph())
+    builder.add_node("proposer", build_proposer_subgraph())
+    builder.add_node("adversary", build_adversary_subgraph())
     builder.add_node("verdict", verdict)
 
-    # Linear chain: START → load_memory → interviewer → proposer → adversary → moderator
+    # -- Pre-debate linear chain --
     builder.add_edge(START, "load_memory")
     builder.add_edge("load_memory", "interviewer")
-    builder.add_edge("interviewer", "proposer")
-    builder.add_edge("proposer", "adversary")
-    builder.add_edge("adversary", "moderator")
+    builder.add_edge("interviewer", "moderator")
 
-    # Moderator → scoreboard → request_handler (linear)
-    builder.add_edge("moderator", "scoreboard")
-    builder.add_edge("scoreboard", "request_handler")
-
-    # Conditional routing after request processing
+    # -- Moderator routes to proposer, adversary, or verdict --
     builder.add_conditional_edges(
-        "request_handler",
-        route_after_requests,
+        "moderator",
+        parent_router,
         {
-            "deep_dive_proposer": "deep_dive_proposer",
-            "round_increment": "round_increment",
+            "proposer": "proposer",
+            "adversary": "adversary",
             "verdict": "verdict",
         },
     )
 
-    # Deep dive sub-flow → loops back to moderator for re-scoring
-    builder.add_edge("deep_dive_proposer", "deep_dive_adversary")
-    builder.add_edge("deep_dive_adversary", "moderator")
+    # -- Proposer and adversary always return to moderator --
+    builder.add_edge("proposer", "moderator")
+    builder.add_edge("adversary", "moderator")
 
-    # After round increment, loop back to proposer for the next round
-    builder.add_edge("round_increment", "proposer")
-
-    # Verdict is terminal
+    # -- Terminal --
     builder.add_edge("verdict", END)
 
     return builder.compile()

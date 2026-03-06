@@ -1,20 +1,21 @@
-"""Proposer logic — pure generator, no UI. Yields structured events."""
+"""Proposer logic — tool-calling agent, yields structured events."""
 
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Generator
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
 import prompts.proposer as proposer_prompts
 from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, PROPOSER_MODEL
 from state import DebateState
-from tools.search import format_results_for_prompt, run_search, search_for_case_studies
+from tools.agent_tools import deep_dive, web_search
 
 Event = dict[str, Any]
+
+_TOOLS = [web_search, deep_dive]
 
 _client: ChatOpenAI | None = None
 
@@ -30,23 +31,12 @@ def _get_client() -> ChatOpenAI:
     return _client
 
 
-def _strip_fences(raw: str) -> str:
-    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-    raw = re.sub(r"\s*```$", "", raw)
-    return raw.strip()
-
-
-def _generate_search_queries(client: ChatOpenAI, problem: str) -> list[str]:
-    prompt = proposer_prompts.build_search_query_prompt(problem)
-    response = client.invoke([HumanMessage(content=prompt)])
-    raw = _strip_fences(response.content.strip())
-    try:
-        queries = json.loads(raw)
-        if isinstance(queries, list):
-            return [str(q) for q in queries[:2]]
-    except json.JSONDecodeError:
-        pass
-    return []
+def _execute_tool(tool_call: dict) -> str:
+    tool_map = {t.name: t for t in _TOOLS}
+    func = tool_map.get(tool_call["name"])
+    if func is None:
+        return f"Unknown tool: {tool_call['name']}"
+    return func.invoke(tool_call["args"])
 
 
 def _extract_request(text: str) -> tuple[str, dict | None]:
@@ -69,13 +59,14 @@ def _extract_request(text: str) -> tuple[str, dict | None]:
 
 
 class ProposerEngine:
-    """Runs proposer logic as a generator yielding events."""
+    """Runs proposer logic as a tool-calling agent yielding events."""
 
     def __init__(self) -> None:
         self.last_result: dict | None = None
 
     def run(self, state: DebateState) -> Generator[Event, None, None]:
         client = _get_client()
+        bound = client.bind_tools(_TOOLS)
         current_round = state["round"]
         user_memory = state.get("user_memory", {})
         momentum = state.get("momentum")
@@ -92,42 +83,10 @@ class ProposerEngine:
             max_rounds=state["max_rounds"],
         )
 
-        # --- Search ---
-        yield {"type": "status", "agent": "proposer", "message": "Researching..."}
-        queries = _generate_search_queries(client, state["problem"])
-
-        search_context = ""
-        total_sources = 0
-        if queries:
-            all_results = []
-            for i, query in enumerate(queries):
-                yield {
-                    "type": "search_start",
-                    "agent": "proposer",
-                    "query": query,
-                    "index": i + 1,
-                    "total": len(queries),
-                }
-                results = search_for_case_studies(query, max_results=5)
-                if not results:
-                    results = run_search(query, max_results=5)
-                block = f"Query: {query}\n{format_results_for_prompt(results)}"
-                all_results.append(block)
-                total_sources += len(results)
-            search_context = "\n---\n".join(all_results)
-            yield {
-                "type": "search_done",
-                "agent": "proposer",
-                "sources": total_sources,
-                "queries": len(queries),
-            }
-
-        # --- Build prompt ---
         if current_round == 1:
             human_prompt = proposer_prompts.build_round1_prompt(
                 state["problem"],
                 enriched_context=enriched_context,
-                search_context=search_context,
             )
         else:
             human_prompt = proposer_prompts.build_revision_prompt(
@@ -135,14 +94,38 @@ class ProposerEngine:
                 adversary_solution=state["last_adversary_solution"],
                 hitl_answer=state.get("hitl_answer"),
                 enriched_context=enriched_context,
-                search_context=search_context,
                 user_interjection=state.get("user_interjection"),
                 debate_history=debate_history,
             )
 
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
 
-        # --- Stream response ---
+        # Agent tool-calling loop
+        while True:
+            response: AIMessage = bound.invoke(messages)
+            messages.append(response)
+
+            if not response.tool_calls:
+                break
+
+            for tc in response.tool_calls:
+                yield {
+                    "type": "tool_call",
+                    "agent": "proposer",
+                    "tool": tc["name"],
+                    "args": tc["args"],
+                }
+                result = _execute_tool(tc)
+                messages.append(
+                    ToolMessage(content=result, tool_call_id=tc["id"])
+                )
+                yield {
+                    "type": "tool_result",
+                    "agent": "proposer",
+                    "tool": tc["name"],
+                }
+
+        # Stream final response
         yield {
             "type": "stream_start",
             "agent": "proposer",
@@ -151,7 +134,7 @@ class ProposerEngine:
         }
 
         chunks: list[str] = []
-        for chunk in client.stream(messages):
+        for chunk in client.stream(messages[:-1]):
             token = chunk.content or ""
             chunks.append(token)
             yield {"type": "token", "agent": "proposer", "token": token}
@@ -164,10 +147,8 @@ class ProposerEngine:
             "agent": "proposer",
             "solution": solution,
             "round": current_round,
-            "sources": total_sources,
         }
 
-        # Build state updates
         new_entry = {
             "agent": "proposer",
             "model": PROPOSER_MODEL,
@@ -180,12 +161,6 @@ class ProposerEngine:
             "last_proposer_solution": solution,
             "proposals": state["proposals"] + [new_entry],
             "user_interjection": None,
-            "search_metadata": state.get("search_metadata", []) + [{
-                "agent": "proposer",
-                "round": current_round,
-                "queries": queries,
-                "source_count": total_sources,
-            }],
         }
         if request:
             updates["agent_requests"] = state.get("agent_requests", []) + [request]

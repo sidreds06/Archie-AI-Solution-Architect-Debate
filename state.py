@@ -1,4 +1,11 @@
-from typing import TypedDict
+from typing import Annotated, TypedDict
+
+from langgraph.graph import MessagesState
+
+
+def _replace_messages(left: list, right: list) -> list:
+    """Reducer: always replace agent messages (no accumulation)."""
+    return right
 
 
 class DebateState(TypedDict):
@@ -23,8 +30,6 @@ class DebateState(TypedDict):
 
     # --- Dynamic graph ---
     agent_requests: list[dict]      # [{agent, request_type, detail}]
-    pending_deep_dive: str | None   # topic for deep-dive sub-flow
-    deep_dives_used: int            # cap at 1
 
     # --- Momentum / personality ---
     momentum: dict                  # {"proposer": float, "adversary": float}
@@ -33,8 +38,14 @@ class DebateState(TypedDict):
     # --- User input between rounds ---
     user_interjection: str | None   # typed by user at round checkpoint
 
+    # --- Hub-spoke orchestration ---
+    debate_phase: str               # current phase for moderator hub routing
+
     # --- UI metadata (used by Gradio smart UI) ---
     search_metadata: list[dict]     # [{agent, round, queries: [str], source_count: int}]
     timing: dict                    # {"debate_start": float, "round_times": [float]}
     token_counts: dict              # {"proposer": [int], "adversary": [int]} per round
     hitl_history: list[dict]        # [{round, question, answer, scores_before, scores_after}]
+
+    # --- Internal: agent loop messages (reset per subgraph call) ---
+    _agent_messages: Annotated[list, _replace_messages]

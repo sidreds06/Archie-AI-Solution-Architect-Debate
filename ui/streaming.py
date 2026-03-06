@@ -1,3 +1,5 @@
+import re
+
 from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from rich.console import Console
@@ -5,6 +7,14 @@ from rich.live import Live
 from rich.panel import Panel
 
 console = Console()
+
+# Pattern to match raw tool call JSON that some models emit as text
+_TOOL_JSON_RE = re.compile(r'\{"tool_uses"\s*:\s*\[.*?\]\}', re.DOTALL)
+
+
+def _strip_tool_json(text: str) -> str:
+    """Remove raw tool call JSON blocks from text content."""
+    return _TOOL_JSON_RE.sub("", text).strip()
 
 
 def stream_to_panel(
@@ -23,6 +33,12 @@ def stream_to_panel(
         for chunk in client.stream(messages):
             token = chunk.content or ""
             chunks.append(token)
-            full_text = "".join(chunks)
+            full_text = _strip_tool_json("".join(chunks))
             live.update(Panel(full_text, title=title, border_style=border_style))
-    return "".join(chunks)
+
+        # Final update with done indicator in title
+        full_text = _strip_tool_json("".join(chunks))
+        done_title = f"{title} [dim]\\[done][/dim]"
+        live.update(Panel(full_text, title=done_title, border_style=border_style))
+
+    return _strip_tool_json("".join(chunks))
